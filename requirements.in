@@ -4,7 +4,6 @@ python-dotenv
 flask
 flask_sqlalchemy
 PyJWT
-werkzeug
-pillow
-pytesseract
 psycopg2-binary
+flask-bcrypt
+flask_cors

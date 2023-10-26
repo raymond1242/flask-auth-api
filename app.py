@@ -1,21 +1,22 @@
 import os
-import io
 import jwt
-from uuid import uuid4
+# import psycopg2
 from dotenv import load_dotenv
-from flask import Flask, jsonify, request, make_response, Response
+from flask import Flask, jsonify, request, make_response
 from flask_sqlalchemy import SQLAlchemy
-from PIL import Image as PILImage
-from werkzeug.security import generate_password_hash, check_password_hash
+from flask_bcrypt import Bcrypt
+from flask_cors import CORS
 from functools import wraps
-import datetime
-from pytesseract import image_to_string
 
 load_dotenv()
 
 app = Flask(__name__)
-
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY')
+
+CORS(
+    app=app,
+    origins=['http://localhost:5173']
+)
 
 IS_PRODUCTION = os.getenv('ENVIRONMENT') == 'production'
 
@@ -27,6 +28,7 @@ else:
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = True
 
 db = SQLAlchemy(app)
+bcrypt = Bcrypt(app)
 
 
 class User(db.Model):
@@ -34,15 +36,14 @@ class User(db.Model):
     name = db.Column(db.String)
     email = db.Column(db.String, unique=True)
     password = db.Column(db.String)
+    last_verification_token = db.Column(db.String)
 
 
-class Image(db.Model):
+class Product(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    uuid = db.Column(db.String, unique=True)
-    user_id = db.Column(db.Integer, db.ForeignKey('user.id'))
-    created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
-    image_data = db.Column(db.LargeBinary, nullable=False)
-    mime_type = db.Column(db.String)
+    name = db.Column(db.String)
+    price = db.Column(db.Float)
+    quantity = db.Column(db.Integer)
 
 
 @app.route("/")
@@ -90,6 +91,7 @@ def login():
     auth = request.form
   
     if not auth or not auth.get('email') or not auth.get('password'):
+        print("Missing parameters")
         return make_response('Missing parameters', 400)
   
     user = User.query.filter_by(email=auth.get('email')).first()
@@ -97,7 +99,7 @@ def login():
     if not user:
         return make_response('User does not exist', 401)
 
-    if check_password_hash(user.password, auth.get('password')):
+    if bcrypt.check_password_hash(user.password, auth.get('password')):
         token = jwt.encode({
             'email': user.email,
         }, app.config['SECRET_KEY'], algorithm="HS256")
@@ -119,7 +121,7 @@ def signup():
         user = User(
             name = data.get('name'),
             email = data.get('email'),
-            password = generate_password_hash(data.get('password'))
+            password = bcrypt.generate_password_hash(data.get('password')).decode('utf-8')
         )
         db.session.add(user)
         db.session.commit()
@@ -129,50 +131,130 @@ def signup():
         return make_response('User already exists. Please Log in.', 202)
 
 
-@app.route('/image', methods =['POST'])
+@app.route('/forgot-password', methods =['POST'])
+def forgot_password():
+    data = request.form
+
+    if not data.get('email'):
+        return make_response('Missing parameters', 400)
+
+    user = User.query.filter_by(email=data.get('email', None)).first()
+    if not user:
+        return make_response('User does not exist', 401)
+
+    token = jwt.encode({
+        'email': user.email,
+    }, app.config['SECRET_KEY'], algorithm="HS256")
+
+    user.last_verification_token = token
+    db.session.commit()
+
+    return make_response('Successfully sent verification token.', 200)
+
+
+@app.route('/reset-password', methods =['POST'])
+def reset_password():
+    data = request.form
+
+    if not data.get('email') or not data.get('password') or not data.get('token'):
+        return make_response('Missing parameters', 400)
+
+    user = User.query.filter_by(email=data.get('email', None)).first()
+    if not user:
+        return make_response('User does not exist', 401)
+
+    if user.last_verification_token != data.get('token'):
+        return make_response('Invalid token', 401)
+
+    user.password = bcrypt.generate_password_hash(data.get('password'))
+    user.last_verification_token = None
+    db.session.commit()
+
+    return make_response('Successfully reset password.', 200)
+
+
+@app.route('/products', methods =['GET'])
 @token_required
-def upload_image(current_user):
-    image = request.files['image']
-    if not image:
-        return make_response('Missing image', 400)
-    try:
-        image_uuid = str(uuid4())
-        image = Image(
-            uuid = image_uuid,
-            user_id = current_user.id,
-            image_data = image.read(),
-            mime_type = image.mimetype
-        )
-        db.session.add(image)
-        db.session.commit()
-        return make_response(jsonify({'image_uuid': image_uuid}), 201)
-    except Exception as e:
-        return make_response(jsonify({'error': f'{e}'}), 500)
+def get_all_products(current_user):
+    products = Product.query.all()
+    output = []
+    for product in products:
+        output.append({
+            'id': product.id,
+            'name' : product.name,
+            'price' : product.price,
+            'quantity' : product.quantity
+        })
+  
+    return jsonify({'products': output})
 
 
-@app.route('/image/<image_uuid>', methods =['GET'])
+@app.route('/products', methods =['POST'])
 @token_required
-def get_image(current_user, image_uuid):
-    image = Image.query.filter_by(uuid=image_uuid).first()
-    if not image:
-        return 'Image not found', 404
-    return Response(image.image_data, mimetype=image.mime_type)
+def create_product(current_user):
+    data = request.form
+
+    if not data.get('name') or not data.get('price') or not data.get('quantity'):
+        return make_response('Missing parameters', 400)
+
+    product = Product(
+        name = data.get('name'),
+        price = data.get('price'),
+        quantity = data.get('quantity')
+    )
+    db.session.add(product)
+    db.session.commit()
+
+    return make_response('Successfully created.', 201)
 
 
-@app.route('/extract_text/<image_uuid>', methods =['GET'])
+@app.route('/products/<product_id>', methods =['GET'])
 @token_required
-def extract_text(current_user, image_uuid):
-    image = Image.query.filter_by(uuid=image_uuid).first()
-    if not image:
-        return make_response('Image not found', 404)
-    
-    byte_image = PILImage.open(io.BytesIO(image.image_data))
-    text = image_to_string(byte_image)
-    if text:
-        return make_response(jsonify({'text': text}), 200)
-    else:
-        return make_response(jsonify({'message': 'No text found'}), 204)
+def get_product(current_user, product_id):
+    product = Product.query.filter_by(id=product_id).first()
+    if not product:
+        return make_response('Product not found.', 404)
 
+    return jsonify({
+        'id': product.id,
+        'name' : product.name,
+        'price' : product.price,
+        'quantity' : product.quantity
+    })
+
+
+@app.route('/products/<product_id>', methods =['PUT'])
+@token_required
+def update_product(current_user, product_id):
+    product = Product.query.filter_by(id=product_id).first()
+    if not product:
+        return make_response('Product not found.', 404)
+
+    data = request.form
+
+    if data.get('name'):
+        product.name = data.get('name')
+    if data.get('price'):
+        product.price = data.get('price')
+    if data.get('quantity'):
+        product.quantity = data.get('quantity')
+
+    db.session.commit()
+
+    return make_response('Successfully updated.', 200)
+
+
+@app.route('/products/<product_id>', methods =['DELETE'])
+@token_required
+def delete_product(current_user, product_id):
+    product = Product.query.filter_by(id=product_id).first()
+    if not product:
+        return make_response('Product not found.', 404)
+
+    db.session.delete(product)
+    db.session.commit()
+
+    return make_response('Successfully deleted.', 200)
 
 if __name__ == "__main__":
     debug = not IS_PRODUCTION
