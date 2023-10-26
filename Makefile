@@ -2,8 +2,6 @@ compile-requirements:
 	pip-compile requirements.in
 install:
 	pip install -r requirements.txt
-run:
-	python app.py
 build:
 	docker compose build
 start:
